@@ -281,14 +281,24 @@ can lead to memory leak.")))))
     (setf *lisp-callback-fn-ptr* (callback lisp-callback-fn)
           *getattr-ptr* (callback getattr-fn)
           *setattr-ptr* (callback setattr-fn))
-    (raw-pyexec #.(format nil "import ctypes
+    ;; Resolve the helper library path at RUNTIME (not read time) so that a
+    ;; saved/relocated image can point *utils-shared-object-path* at a bundled
+    ;; copy or a bare soname (resolved via LD_LIBRARY_PATH). Using #. here would
+    ;; freeze the build-time absolute path into the compiled image, which breaks
+    ;; relocatable/standalone builds.
+    (raw-pyexec (format nil "import ctypes
 py4cl_utils = ctypes.pydll.LoadLibrary(\"~A\")
 " (namestring *utils-shared-object-path*))))
 
   (with-verbosity "Reading py4cl.py"
-    (raw-pyexec (read-file-into-string
-                 (asdf:component-pathname
-                  (asdf:find-component (asdf:find-system "py4cl2-cffi") "py4cl.py")))))
+    ;; Embed the contents of py4cl.py into the compiled image at READ time, so a
+    ;; saved/relocated image does not need the py4cl2-cffi source tree present at
+    ;; runtime. (Reading the file at runtime via asdf:component-pathname fails in
+    ;; a standalone build because that source path does not exist on the target
+    ;; machine.) The script is static, so compile-time inlining is safe.
+    (raw-pyexec #.(uiop:read-file-string
+                   (asdf:component-pathname
+                    (asdf:find-component (asdf:find-system "py4cl2-cffi") "py4cl.py")))))
 
   (with-verbosity "Importing python module: decimal"
     (raw-pyexec "import decimal; Decimal = decimal.Decimal"))
