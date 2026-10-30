@@ -82,8 +82,10 @@
         ("PyObject_GetAttrString" :new)
         ("PyObject_SetAttrString" nil)
         ("PyLong_FromLong"    :new)
+        ("PyLong_FromLongLong" :new)
         ("PyLong_FromSsize_t" :new)
         ("PyLong_AsLong"      nil)
+        ("PyLong_AsLongLong"  nil)
         ("PyFloat_FromDouble" :new)
         ("PyFloat_AsDouble"   nil)
         ("PyUnicode_FromString" :new)
@@ -240,12 +242,17 @@ This avoids inadvertent calls to DecRef during recursions.")
                                               addr)
                                         (type fixnum count))
                         (when (not (zerop addr))
+                          ;; ADDR is a pointer address. On Windows (LLP64) a C
+                          ;; `unsigned long` is only 32 bits, so passing a
+                          ;; 64-bit address as :UNSIGNED-LONG truncates/overflows
+                          ;; ("value ... not of type (UNSIGNED-BYTE 32)"). Use
+                          ;; :UINTPTR, which is pointer-width on every platform.
                           (cond ((< count 0)
                                  (foreign-funcall "Py_IncRef"
-                                                  :unsigned-long addr))
+                                                  :uintptr addr))
                                 ((> count 0)
                                  (foreign-funcall "Py_DecRef"
-                                                  :unsigned-long addr))))
+                                                  :uintptr addr))))
                         (remhash addr ht)))))))
     (clear-lisp-objects))
   nil)

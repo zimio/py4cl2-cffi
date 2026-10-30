@@ -11,6 +11,12 @@
   :serial t
   :components ((:file "config-darwin")))
 
+(defsystem "py4cl2-cffi/config-windows"
+  :pathname #P"src/"
+  :depends-on ("py4cl2-cffi/config" "uiop")
+  :serial t
+  :components ((:file "config-windows")))
+
 (defsystem "py4cl2-cffi"
   :pathname #P"src/"
   :description "CFFI based alternative to PY4CL2, primarily developed for performance reasons."
@@ -33,11 +39,13 @@
                "float-features"
                "parse-number"
                "py4cl2-cffi/config"
-               (:feature :darwin "py4cl2-cffi/config-darwin"))
+               (:feature :darwin "py4cl2-cffi/config-darwin")
+               (:feature :win32 "py4cl2-cffi/config-windows"))
   :serial t
   :components ((:static-file "py4cl.py")
                (:file "package")
                (:file "lisp-utils")
+               (:file "windows-named-pipe")
                (:static-file "py4cl-utils.c")
                (:static-file "py4cl-numpy-utils.c")
                (:static-file "numpy-installed-p.txt")

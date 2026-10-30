@@ -23,7 +23,11 @@
   (lisp-object (pyslot-value o "handle")))
 
 (define-lispifier "int" (o)
-  (pyforeign-funcall "PyLong_AsLong" :pointer o :long))
+  ;; Use PyLong_AsLongLong (always 64-bit) rather than PyLong_AsLong. On
+  ;; Windows (LLP64) a C `long` is only 32 bits, so python ints that fit a
+  ;; 64-bit value -- including object ids/addresses used by DEFPYMODULE --
+  ;; overflow PyLong_AsLong and raise "int too large to convert to C long".
+  (pyforeign-funcall "PyLong_AsLongLong" :pointer o :long-long))
 
 (define-lispifier "float" (o)
   (pyforeign-funcall "PyFloat_AsDouble" :pointer o :double))
@@ -65,7 +69,7 @@
     vec))
 
 (define-lispifier "dict" (o)
-  (let ((py-size (pyforeign-funcall "PyDict_Size" :pointer o :long))
+  (let ((py-size (pyforeign-funcall "PyDict_Size" :pointer o :long-long))
         (hash-table (make-hash-table :test #'equal))
         (py-keys (pyforeign-funcall "PyDict_Keys" :pointer o :pointer)))
     (loop :for i :below py-size

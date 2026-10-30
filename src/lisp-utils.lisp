@@ -53,7 +53,20 @@
                                          (1+ ,new-item-pos))))))))
 
 (defun mkfifo (path)
-  (cffi:foreign-funcall "mkfifo" :string path :int #o0664))
+  "Create a named pipe (FIFO) at PATH on unix-like systems.
+
+Windows has no mkfifo; CPython on Windows also cannot usefully open a Win32
+named pipe through Python's builtin `open`. Instead we fall back to a plain
+file that python writes to and lisp tails. Here we simply (re)create an empty
+file so the subsequent OPEN for input succeeds."
+  (if (eq :win (uiop:operating-system))
+      (progn
+        (with-open-file (s path :direction :output
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+          (declare (ignore s)))
+        0)
+      (cffi:foreign-funcall "mkfifo" :string path :int #o0664)))
 
 (defmacro ensure-non-null-pointer (pointer
                                    &key (format-control nil format-control-p)

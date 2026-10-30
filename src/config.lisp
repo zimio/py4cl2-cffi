@@ -34,19 +34,29 @@
 
 (declaim (type string *python-compile-command*))
 
+;; On Windows, CPython is normally built with MSVC. The helper C files below
+;; only use the stable CPython C-API, so they can also be built with MinGW-w64
+;; gcc linking against pythonXY.lib. These defaults target gcc; the exact
+;; include/lib flags are filled in by config-windows.lisp (see below).
 (defvar *python-compile-command*
-  (concatenate
-   'string
-   "gcc ~A -c -Wall -Werror -fpic py4cl-utils.c && "
-   "gcc -shared -o libpy4cl-utils.so py4cl-utils.o")
+  (if (eq :win (uiop:operating-system))
+      ;; ~A -> *python-includes*, filled by config-windows.lisp with the
+      ;; full command (it needs the python lib dir which is discovered here).
+      "gcc ~A -shared -o libpy4cl-utils.dll py4cl-utils.c"
+      (concatenate
+       'string
+       "gcc ~A -c -Wall -Werror -fpic py4cl-utils.c && "
+       "gcc -shared -o libpy4cl-utils.so py4cl-utils.o"))
   "~A corresponds to the *python-includes*
 ")
 
 (defvar *python-numpy-compile-command*
-  (concatenate
-   'string
-   "gcc ~A -I'~A' -c -Wall -Werror -fpic py4cl-numpy-utils.c && "
-   "gcc -shared -o libpy4cl-numpy-utils.so py4cl-numpy-utils.o")
+  (if (eq :win (uiop:operating-system))
+      "gcc ~A -I\"~A\" -shared -o libpy4cl-numpy-utils.dll py4cl-numpy-utils.c"
+      (concatenate
+       'string
+       "gcc ~A -I'~A' -c -Wall -Werror -fpic py4cl-numpy-utils.c && "
+       "gcc -shared -o libpy4cl-numpy-utils.so py4cl-numpy-utils.o"))
   "The first~A corresponds to the *python-includes*
 The second ~A corresponds to the numpy include files discovered
   in shared-objects.lisp
@@ -56,43 +66,94 @@ The second ~A corresponds to the numpy include files discovered
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
   (defun return-value-as-list (cmd)
+    "Run CMD (a string passed to the shell, or a list of program + args)
+and return its whitespace-separated output tokens as a list of strings."
     (remove ""
             (mapcar (lambda (value)
-                      (string-trim '(#\newline) value))
+                      (string-trim '(#\newline #\return) value))
                     (uiop:split-string
                      (uiop:run-program cmd
                                        :output :string
                                        :error-output *error-output*)
-                     :separator '(#\newline #\tab #\space)))
+                     :separator '(#\newline #\return #\tab #\space)))
             :test #'string=))
-  
-  (defvar *python-executable-path*
-    (if (uiop:getenv "PY4CL2_CONFIG_PYTHON_EXECUTABLE_PATH")
-	(uiop:getenv "PY4CL2_CONFIG_PYTHON_EXECUTABLE_PATH")
-	(first (return-value-as-list "which python3")))
+
+  (defun python-eval-to-string (python-executable code)
+    "Run a one-liner of python CODE using PYTHON-EXECUTABLE and return the
+raw string printed to stdout. CODE is passed as a separate argv element so
+that no shell quoting (which differs between sh and cmd.exe) is required."
+    (string-trim
+     '(#\newline #\return #\space #\tab)
+     (uiop:run-program (list python-executable "-c" code)
+                       :output :string
+                       :error-output *error-output*)))
+
+  (defun %find-python-executable ()
+    (cond
+      ((uiop:getenv "PY4CL2_CONFIG_PYTHON_EXECUTABLE_PATH")
+       (uiop:getenv "PY4CL2_CONFIG_PYTHON_EXECUTABLE_PATH"))
+      ((eq :win (uiop:operating-system))
+       ;; `which` does not exist on Windows; use `where` and take the first hit.
+       (or (first (return-value-as-list (list "where" "python")))
+           (first (return-value-as-list (list "where" "python3")))
+           "python"))
+      (t
+       (first (return-value-as-list "which python3")))))
+
+  (defvar *python-executable-path* (%find-python-executable)
     "The path to python executable. This will be used to set sys.path.
 This is useful in cases such as venv when python3-config does not lead
 to expected paths.")
 
   (alexandria:define-constant +python-version-string+
-      (second (return-value-as-list (format nil "~A --version"
-					    *python-executable-path*)))
+      ;; "python --version" prints e.g. "Python 3.9.5"; grab the version token.
+      (let ((tokens (return-value-as-list
+                     (list *python-executable-path* "--version"))))
+        (or (find-if (lambda (tok) (digit-char-p (char tok 0))) tokens)
+            (second tokens)))
     :test #'string=)
 
-  (if (uiop:version< +python-version-string+ "3.8.0")
+  (defun %windows-python-ldflags (python-executable)
+    "Derive the equivalent of python3-config --embed --ldflags on Windows.
+CPython on Windows does not ship python3-config, so we query sysconfig for
+the import-library directory and version and build the flags ourselves."
+    (let* ((libdir
+             ;; On Windows the import libs live under <base>/libs .
+             (python-eval-to-string
+              python-executable
+              "import os,sysconfig,sys;print(os.path.join(sysconfig.get_config_var('installed_base') or sys.base_prefix,'libs'))"))
+           (version
+             ;; e.g. "39" for Python 3.9
+             (python-eval-to-string
+              python-executable
+              "import sysconfig;print(sysconfig.get_config_var('VERSION'))")))
+      (list (format nil "-L~A" libdir)
+            (format nil "-lpython~A" version))))
+
+  (if (eq :win (uiop:operating-system))
       (defvar *python-ldflags*
-        (return-value-as-list "python3-config --ldflags"))
-      (defvar *python-ldflags*
-        (return-value-as-list "python3-config --embed --ldflags"))))
+        (%windows-python-ldflags *python-executable-path*))
+      (if (uiop:version< +python-version-string+ "3.8.0")
+          (defvar *python-ldflags*
+            (return-value-as-list "python3-config --ldflags"))
+          (defvar *python-ldflags*
+            (return-value-as-list "python3-config --embed --ldflags")))))
 
 
 (defvar *python-includes*
-  (return-value-as-list "python3-config --includes"))
+  (if (eq :win (uiop:operating-system))
+      (list (format nil "-I~A"
+                    (python-eval-to-string
+                     *python-executable-path*
+                     "import sysconfig;print(sysconfig.get_path('include'))")))
+      (return-value-as-list "python3-config --includes")))
 
 (defvar *python-site-packages-path*
+  ;; Pass the python snippet as a single argv element (no shell quoting), so it
+  ;; works the same under /bin/sh and cmd.exe .
   (return-value-as-list
-   (format nil "~A -c 'import sys; print(\"\\n\".join(sys.path))'"
-	   *python-executable-path*)))
+   (list *python-executable-path*
+         "-c" "import sys;print(chr(10).join(sys.path))")))
 
 (defun print-configuration ()
   "Prints the ldflags and includes that will be used for the compilation
@@ -156,4 +217,17 @@ corresponding to it. In this case, on linux, it will return libpython3.10.so"
   (format nil "lib~A.dylib" (subseq ldflag 2)))
 
 (defmethod shared-library-from-ldflag (ldflag (operating-system (eql :win)))
-  (format nil "lib~A.dll" (subseq ldflag 2)))
+  ;; CPython on Windows ships its interpreter DLL as e.g. "python39.dll"
+  ;; (no "lib" prefix, no dot between major and minor version), while the
+  ;; helper libraries we build ourselves are named "libpy4cl-utils.dll" etc.
+  ;; Only the python ldflag needs the special CPython naming; everything else
+  ;; keeps the conventional "lib<name>.dll".
+  (let ((name (subseq ldflag 2)))
+    (cond
+      ;; e.g. "-lpython3.9" -> "python39.dll"
+      ((and (>= (length name) 6)
+            (string-equal "python" (subseq name 0 6)))
+       (format nil "~A.dll" (remove #\. name)))
+      ;; e.g. "-lpython39" -> "python39.dll"
+      (t
+       (format nil "lib~A.dll" name)))))

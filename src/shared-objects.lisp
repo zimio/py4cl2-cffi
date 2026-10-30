@@ -38,10 +38,13 @@
         ((asdf:component-pathname (asdf:find-system "py4cl2-cffi")))
       (multiple-value-bind (numpy-path error-output error-status)
 	  (uiop:run-program
-           (concatenate 'string "cd ~/;"
-			(format nil "~A -c 'import numpy; print(numpy.__path__[0])'"
-				py4cl2-cffi/config:*python-executable-path*))
-           :output :string :ignore-error-status t)
+           ;; Pass the python snippet as a separate argv element (portable
+           ;; across /bin/sh and cmd.exe) and run from the home directory so
+           ;; that numpy is not accidentally imported from the project dir.
+           (list py4cl2-cffi/config:*python-executable-path*
+                 "-c" "import numpy; print(numpy.__path__[0])")
+           :output :string :ignore-error-status t
+           :directory (user-homedir-pathname))
         (declare (ignore error-output))
         (let* ((numpy-installed-p
                 (zerop error-status))
@@ -49,10 +52,11 @@
                  (first
                   (uiop:parse-version
                    (uiop:run-program
-                    (format nil "~A -c 'import numpy; print(numpy.__version__, end=\"\")'"
-			                      *python-executable-path*)
+                    (list *python-executable-path*
+                          "-c" "import numpy; print(numpy.__version__, end=\"\")")
                     :output :string
-                    :ignore-error-status t))))               
+                    :ignore-error-status t
+                    :directory (user-homedir-pathname)))))               
                (program-string
                  (format nil
                          *python-numpy-compile-command*
@@ -60,7 +64,7 @@
                          (format nil (if (eql 2 numpy-version)
                                          "~A/_core/include/"
                                          "~A/core/include/")
-                                 (string-trim (list #\newline) numpy-path)))))
+                                 (string-trim (list #\newline #\return) numpy-path)))))
           (when numpy-installed-p
             (format t "~&~A~%" program-string)
             (uiop:run-program program-string
@@ -82,9 +86,10 @@
       (let* ((numpy-installed-p
 	       (zerop (nth-value 2
                                  (uiop:run-program
-                                  (format nil "~A -c 'import numpy'"
-					  py4cl2-cffi/config:*python-executable-path*)
-                                                   :ignore-error-status t))))
+                                  (list py4cl2-cffi/config:*python-executable-path*
+                                        "-c" "import numpy")
+                                  :ignore-error-status t
+                                  :directory (user-homedir-pathname)))))
              (numpy-installed-p-new
                (with-standard-io-syntax
                  (write-to-string numpy-installed-p))))

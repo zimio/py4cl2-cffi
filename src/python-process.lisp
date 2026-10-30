@@ -121,9 +121,90 @@ to the stream specified in WITH-PYTHON-*-OUTPUT "
 ;; Opening the pipe multiple times does not work, at least for small read/writes,
 ;; the data in the pipes accumulates. Thus every time the pipe is opened, *all*
 ;; the writes until that point of time are read.
+(defvar *py-capture-counter* 0
+  "Counter used to generate unique temporary names for StringIO capture on
+Windows.")
+
+(defvar *py-active-capture-buffers* (make-hash-table :test #'equal)
+  "Maps \"stdout\"/\"stderr\" to the python variable name of the io.StringIO
+currently installed for it (or NIL). Used so that nested capture calls share a
+single StringIO instead of each installing their own and hiding output from the
+outer capture.")
+
+(defun %run-simple-string/no-capture (command)
+  "Run COMMAND via PyRun_SimpleString without going through the output-capture
+wrapper. Used by the Windows StringIO capture to avoid re-entering (and thus
+infinitely recursing into) CALL-THUNK-PYTHON-ERROR-OR-OUTPUT."
+  (with-python-gil
+    (let ((rc (pyforeign-funcall "PyRun_SimpleString" :string command :int)))
+      (unless (zerop rc)
+        (error 'pyerror
+               :format-control "Error while running python command:~%  ~A"
+               :format-arguments (list command)))
+      rc)))
+
+(defun %call-thunk-capture-via-stringio (thunk stderr-or-stdout)
+  "Windows implementation of output capture.
+
+The unix implementation streams python's stdout/stderr through a FIFO and a
+reader thread synchronised with semaphores. On Windows that protocol is fragile
+across the named-pipe boundary, so instead we temporarily rebind sys.<stream> to
+an io.StringIO for the duration of THUNK and read the buffered text back
+synchronously. This needs no pipe, reader thread, or GIL hand-off.
+
+Setup/teardown use PyRun_SimpleString directly (not RAW-PYEXEC) because the
+latter is itself wrapped in output capture and would recurse endlessly.
+
+Nested captures of the same stream (which happen because RAW-PY wraps every
+exec/eval in WITH-PYTHON-ERROR-OUTPUT) share a single StringIO: only the
+outermost call installs/removes the redirect, and each call returns only the
+text written to the shared buffer during its own dynamic extent."
+  (let ((existing (gethash stderr-or-stdout *py-active-capture-buffers*)))
+    (if existing
+        ;; Nested: reuse the already-installed StringIO. Return only what the
+        ;; thunk adds, measured by the buffer length before and after.
+        (let ((start-len (%capture-buffer-length existing)))
+          (funcall thunk)
+          (%capture-buffer-substring existing start-len))
+        ;; Outermost: install a fresh StringIO, run, read all, then restore.
+        (let* ((n (incf *py-capture-counter*))
+               (saved (format nil "_py4cl_saved_~A_~D" stderr-or-stdout n))
+               (buf   (format nil "_py4cl_buf_~A_~D" stderr-or-stdout n)))
+          (%run-simple-string/no-capture
+           (format nil "import io~%~A = sys.~A~%~A = io.StringIO()~%sys.~A = ~A"
+                   saved stderr-or-stdout buf stderr-or-stdout buf))
+          (setf (gethash stderr-or-stdout *py-active-capture-buffers*) buf)
+          (unwind-protect
+               (progn
+                 (funcall thunk)
+                 (%capture-buffer-substring buf 0))
+            (remhash stderr-or-stdout *py-active-capture-buffers*)
+            (%run-simple-string/no-capture
+             (format nil "sys.~A = ~A~%del ~A~%del ~A"
+                     stderr-or-stdout saved buf saved)))))))
+
+(defun %capture-buffer-length (buf)
+  "Length of the text currently in python StringIO variable BUF."
+  ;; Use a dedicated holder variable (not `_`) so we do not clobber the result
+  ;; of an in-flight RAW-PYEVAL, which stashes its value in `_`.
+  (%run-simple-string/no-capture (format nil "_py4cl_capture_tmp = len(~A.getvalue())" buf))
+  (let ((v (pyvalue "_py4cl_capture_tmp"))) (if (integerp v) v 0)))
+
+(defun %capture-buffer-substring (buf start)
+  "Return the text written to python StringIO variable BUF from character index
+START to the end."
+  (%run-simple-string/no-capture (format nil "_py4cl_capture_tmp = ~A.getvalue()" buf))
+  (let ((result (pyvalue "_py4cl_capture_tmp")))
+    (if (and (stringp result) (<= start (length result)))
+        (subseq result start)
+        "")))
+
 (defun call-thunk-python-error-or-output (thunk output-sync-struct stderr-or-stdout)
   "Capture and return the output produced by python during the
 execution of THUNK as a string."
+  (when (eq :win (uiop:operating-system))
+    (return-from call-thunk-python-error-or-output
+      (%call-thunk-capture-via-stringio thunk stderr-or-stdout)))
   (with-slots (py-stream with-python-stream
                in-with-python-count with-python-count-lock
                with-python-start-semaphore with-python-end-semaphore)
@@ -159,40 +240,77 @@ execution of THUNK as a string."
 
 ;;; This is more of a global variable than a dynamic variable.
 
-(defvar *py-output-stream-pipe*
-  (format nil "/tmp/py4cl2-cffi-output-~D"
-          (cffi:foreign-funcall "getpid" :int)))
-(defvar *py-error-output-stream-pipe*
-  (format nil "/tmp/py4cl2-cffi-error-output-~D"
-          (cffi:foreign-funcall "getpid" :int)))
+(defun %getpid ()
+  "Return the current process id in a way that works on both unix and Windows.
+On Windows the C runtime exports it as `_getpid` rather than `getpid`."
+  (if (eq :win (uiop:operating-system))
+      (cffi:foreign-funcall "_getpid" :int)
+      (cffi:foreign-funcall "getpid" :int)))
+
+(defun %pipe-path (name)
+  "Build the path that is handed to python's open() for capturing stdout/stderr.
+
+On unix this is a filesystem path for a FIFO under the temp directory.
+On Windows this is a \\\\.\\pipe\\ name, which python's open() can write to and
+which lisp serves via a WINDOWS-PIPE-STREAM (see windows-named-pipe.lisp)."
+  (if (eq :win (uiop:operating-system))
+      (format nil "\\\\.\\pipe\\py4cl2-cffi-~A-~D" name (%getpid))
+      (namestring
+       (merge-pathnames (format nil "py4cl2-cffi-~A-~D" name (%getpid))
+                        (uiop:temporary-directory)))))
+
+(defvar *py-output-stream-pipe*       (%pipe-path "output"))
+(defvar *py-error-output-stream-pipe* (%pipe-path "error-output"))
 (defvar *py-output-reader-thread* nil)
 (defvar *py-error-output-reader-thread* nil)
+
+(defun %open-pipe-input-stream (pipe-path)
+  "Open PIPE-PATH for reading from lisp.
+On Windows this creates the named-pipe server (python connects as the client);
+on unix it opens the FIFO as an ordinary input stream."
+  (if (eq :win (uiop:operating-system))
+      (make-windows-named-pipe-server pipe-path)
+      (open pipe-path
+            :direction :input
+            #+ccl :sharing #+ccl :lock)))
+
+(defun %start-reader-thread (sync-struct pipe-path default-output-stream name)
+  "Start a reader thread for PIPE-PATH feeding DEFAULT-OUTPUT-STREAM.
+
+On Windows the pipe-server stream is created synchronously *before* the thread
+starts, so the pipe exists in the \\\\.\\pipe\\ namespace by the time python's
+open() tries to connect (avoiding a FileNotFoundError race). On unix the FIFO
+open blocks until a writer appears, so it must happen inside the thread."
+  (if (eq :win (uiop:operating-system))
+      (let ((stream (%open-pipe-input-stream pipe-path)))
+        (setf (slot-value sync-struct 'py-stream) stream)
+        (bt:make-thread
+         (lambda () (read-output-with-sync sync-struct default-output-stream))
+         :name name))
+      (bt:make-thread
+       (lambda ()
+         (setf (slot-value sync-struct 'py-stream)
+               (%open-pipe-input-stream pipe-path))
+         (read-output-with-sync sync-struct default-output-stream))
+       :name name)))
 
 (defun python-output-thread ()
   (when (and *py-output-reader-thread*
              (bt:thread-alive-p *py-output-reader-thread*))
     (bt:destroy-thread *py-output-reader-thread*))
   (setq *py-output-reader-thread*
-        (bt:make-thread
-         (lambda ()
-           (setf (slot-value *py-output-sync-struct* 'py-stream)
-                 (open *py-output-stream-pipe*
-                       :direction :input
-                       #+ccl :sharing #+ccl :lock))
-           (read-output-with-sync *py-output-sync-struct* *standard-output*))
-         :name "py4cl2-cffi-output-thread"))
+        (%start-reader-thread *py-output-sync-struct*
+                              *py-output-stream-pipe*
+                              *standard-output*
+                              "py4cl2-cffi-output-thread"))
   (when (and *py-error-output-reader-thread*
              (bt:thread-alive-p *py-error-output-reader-thread*))
     (bt:destroy-thread *py-error-output-reader-thread*))
   (setq *py-error-output-reader-thread*
-        (bt:make-thread
-         (lambda ()
-           (setf (slot-value *py-error-sync-struct* 'py-stream)
-                 (open *py-error-output-stream-pipe*
-                       :direction :input
-                       #+ccl :sharing #+ccl :lock))
-           (read-output-with-sync *py-error-sync-struct* *error-output*))
-         :name "py4cl2-cffi-error-output-thread")))
+        (%start-reader-thread *py-error-sync-struct*
+                              *py-error-output-stream-pipe*
+                              *error-output*
+                              "py4cl2-cffi-error-output-thread")))
 
 (defmacro with-python-output (&body forms-decl)
   "Gets the output of the python program executed in FORMS-DECL in the form a string."
@@ -211,13 +329,19 @@ execution of THUNK as a string."
 will be executed by PYSTART.")
 
 (defun %pystart-standard (&key (verbose t) (release-gil t))
-  (with-verbosity "(Re)Creating unix named pipes for handling stdout and stderr asynchronously"
-    (when (probe-file *py-output-stream-pipe*)
-      (delete-file *py-output-stream-pipe*))
-    (mkfifo *py-output-stream-pipe*)
-    (when (probe-file *py-error-output-stream-pipe*)
-      (delete-file *py-error-output-stream-pipe*))
-    (mkfifo *py-error-output-stream-pipe*))
+  (if (eq :win (uiop:operating-system))
+      ;; On Windows the named-pipe server is created by the reader threads
+      ;; (see python-output-thread / %open-pipe-input-stream), so there is no
+      ;; FIFO file to (re)create or delete here.
+      (with-verbosity "Using Windows named pipes for handling stdout and stderr asynchronously"
+        nil)
+      (with-verbosity "(Re)Creating unix named pipes for handling stdout and stderr asynchronously"
+        (when (probe-file *py-output-stream-pipe*)
+          (delete-file *py-output-stream-pipe*))
+        (mkfifo *py-output-stream-pipe*)
+        (when (probe-file *py-error-output-stream-pipe*)
+          (delete-file *py-error-output-stream-pipe*))
+        (mkfifo *py-error-output-stream-pipe*)))
 
   (with-verbosity "Loading foreign libraries"
     (load-python-and-libraries))
@@ -263,9 +387,13 @@ can lead to memory leak.")))))
     (python-output-thread))
 
   (with-verbosity "Opening named pipes from python"
-    (raw-pyexec (format nil "sys.stdout = open('~A', 'w')"
+    ;; Use a python raw string (r'...') so Windows pipe names such as
+    ;; \\.\pipe\py4cl2-cffi-output-1234 are not mangled by python's string
+    ;; escape processing. Unix FIFO paths contain no backslashes, so r'...' is
+    ;; equally safe there.
+    (raw-pyexec (format nil "sys.stdout = open(r'~A', 'w')"
                         *py-output-stream-pipe*))
-    (raw-pyexec (format nil "sys.stderr = open('~A', 'w')"
+    (raw-pyexec (format nil "sys.stderr = open(r'~A', 'w')"
                         *py-error-output-stream-pipe*)))
 
   (with-verbosity "Linking __main__, builtins, sys modules to lisp places"
@@ -281,8 +409,11 @@ can lead to memory leak.")))))
     (setf *lisp-callback-fn-ptr* (callback lisp-callback-fn)
           *getattr-ptr* (callback getattr-fn)
           *setattr-ptr* (callback setattr-fn))
-    (raw-pyexec #.(format nil "import ctypes
-py4cl_utils = ctypes.pydll.LoadLibrary(\"~A\")
+    ;; Load the helper library into python via ctypes. Compute the path at
+    ;; runtime and feed it through a raw string so Windows backslashes are not
+    ;; interpreted as python escape sequences.
+    (raw-pyexec (format nil "import ctypes
+py4cl_utils = ctypes.pydll.LoadLibrary(r\"~A\")
 " (namestring *utils-shared-object-path*))))
 
   (with-verbosity "Reading py4cl.py"

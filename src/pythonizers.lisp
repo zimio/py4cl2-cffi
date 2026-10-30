@@ -147,17 +147,20 @@ takes place."))
       lisp-object
       (pycall* "_py4cl_UnknownLispObject" (object-handle lisp-object))))
 
-(deftype c-long ()
-  (let ((num-bits (* 8 (cffi:foreign-type-size :long))))
+(deftype c-long-long ()
+  ;; Use a C `long long` (always 64-bit) rather than `long`, which is only
+  ;; 32-bit on Windows (LLP64). This keeps the representable integer range the
+  ;; same across platforms.
+  (let ((num-bits (* 8 (cffi:foreign-type-size :long-long))))
     `(signed-byte ,num-bits)))
 
 (defmethod pythonize ((o pyobject-wrapper)) (pyobject-wrapper-pointer o))
 
 (defmethod pythonize ((o integer))
-  (unless (typep o 'c-long)
+  (unless (typep o 'c-long-long)
     ;; TODO: Proper warning class
-    (warn "Given integer ~S is too big to be interpreted as a C long" o))
-  (pyforeign-funcall "PyLong_FromLong" :long o :pointer))
+    (warn "Given integer ~S is too big to be interpreted as a C long long" o))
+  (pyforeign-funcall "PyLong_FromLongLong" :long-long o :pointer))
 
 (defmethod pythonize ((o float))
   ;; TODO: Different numpy float types: float32 and float64
@@ -291,9 +294,14 @@ takes place."))
                                            :string "ndarray"
                                            :pointer))
           (ndims        (array-rank array)))
-     (with-foreign-objects ((dims    :long ndims))
+     ;; numpy dimensions are `npy_intp` which is pointer-width (Py_ssize_t):
+     ;; 64-bit on Win64. A C `long` is only 32 bits on Windows (LLP64), so a
+     ;; :LONG buffer would be misread by numpy as 64-bit values, yielding
+     ;; garbage dimensions ("negative dimensions are not allowed" / "array is
+     ;; too big"). Use :LONG-LONG, which is 64-bit on all 64-bit platforms.
+     (with-foreign-objects ((dims    :long-long ndims))
        (dotimes (i ndims)
-         (setf (mem-aref dims :long i) (array-dimension array i)))
+         (setf (mem-aref dims :long-long i) (array-dimension array i)))
        (if (type= t (array-element-type array))
            (let* ((numpy-array
                     (numpy-funcall "PyArray_NewFromDescr"
@@ -348,14 +356,16 @@ takes place."))
     ('t "t")))
 
 (defun integer->py-size (int)
-  (let ((len (pyforeign-funcall "PyLong_FromLong" :long int :pointer)))
+  ;; Py_ssize_t is pointer-width (64-bit on Win64), so build the python int
+  ;; from a `long long` rather than a 32-bit Windows `long`.
+  (let ((len (pyforeign-funcall "PyLong_FromLongLong" :long-long int :pointer)))
     (pyforeign-funcall "PyLong_AsSsize_t" :pointer len :pointer)))
 
 (defun py-size->integer (ptr)
   "WARNING: This function does not track reference counts."
   (with-python-gil/no-errors
     (let ((pylong (foreign-funcall "PyLong_FromSsize_t" :pointer ptr :pointer)))
-      (foreign-funcall "PyLong_AsLong" :pointer pylong :long))))
+      (foreign-funcall "PyLong_AsLongLong" :pointer pylong :long-long))))
 
 (defun pythonize-list (list)
   (let* ((len   (length list))
